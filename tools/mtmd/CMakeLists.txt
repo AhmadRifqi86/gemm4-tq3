@@ -5,6 +5,7 @@ find_package(Threads REQUIRED)
 add_library(mtmd
             mtmd.cpp
             mtmd-audio.cpp
+            mtmd-image.cpp
             mtmd.h
             mtmd-helper.cpp
             mtmd-helper.h
@@ -16,8 +17,11 @@ add_library(mtmd
             models/models.h
             models/cogvlm.cpp
             models/conformer.cpp
+            models/dotsocr.cpp
+            models/gemma4a.cpp
             models/gemma4v.cpp
             models/glm4v.cpp
+            models/hunyuanocr.cpp
             models/internvl.cpp
             models/kimivl.cpp
             models/kimik25.cpp
@@ -29,6 +33,8 @@ add_library(mtmd
             models/pixtral.cpp
             models/qwen2vl.cpp
             models/qwen3vl.cpp
+            models/qwen3a.cpp
+            models/step3vl.cpp
             models/siglip.cpp
             models/whisper-enc.cpp
             models/deepseekocr.cpp
@@ -75,17 +81,22 @@ if (NOT MSVC)
     target_compile_options(mtmd PRIVATE -Wno-cast-qual)
 endif()
 
+if (ANDROID)
+    # miniaudio.h defines ma_android_sdk_version() without a prior prototype
+    target_compile_options(mtmd PRIVATE -Wno-missing-prototypes)
+endif()
+
 if (TARGET BUILD_INFO)
     add_dependencies(mtmd        BUILD_INFO)
     add_dependencies(mtmd-helper BUILD_INFO)
 endif()
 
-# if mtmd is linked against common, we throw an error
+# if mtmd is linked against llama-common, we throw an error
 if (TARGET mtmd)
     get_target_property(libs mtmd LINK_LIBRARIES)
-    if (libs AND "common" IN_LIST libs)
+    if (libs AND "llama-common" IN_LIST libs)
         message(FATAL_ERROR "mtmd is designed to be a public library.\n"
-                            "It must not link against common")
+                            "It must not link against llama-common")
     endif()
 endif()
 
