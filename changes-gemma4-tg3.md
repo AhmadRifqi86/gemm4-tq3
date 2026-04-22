@@ -138,15 +138,37 @@ target_link_libraries(llama-mtmd-debug PRIVATE common mtmd Threads::Threads)
 
 ## Step 5: Build
 
+```
+nano aarch64-toolchain.cmake
+```
+then paste this:
+```
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+# Specify the cross compiler (ensure these are installed on your host)
+set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
+set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+
+# Target root filesystem (optional, but good practice)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+```
+
+then run cmake
 ```bash
 cmake -B build \
-  -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=89 \
-  -DGGML_CUDA_FORCE_CUBLAS=OFF \
-  -DGGML_CUDA_FA_ALL_QUANTS=ON \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_TOOLCHAIN_FILE=aarch64-toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_NATIVE=OFF \
+  -DGGML_CUDA=OFF \
+  -DCMAKE_C_FLAGS="-march=armv8.2-a+fp16+dotprod" \
+  -DCMAKE_CXX_FLAGS="-march=armv8.2-a+fp16+dotprod"
 
-cmake --build build --config Release -j$(nproc)
+cmake --build build --config Release -j2
 ```
 
 > For RTX 5090 / SM 12.0: use `-DCMAKE_CUDA_ARCHITECTURES=120`
