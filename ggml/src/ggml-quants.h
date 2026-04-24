@@ -110,6 +110,25 @@ GGML_API void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_tur
 GGML_API void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// DecoQuant: MPO-decomposed KV cache quantization (arXiv 2405.12591)
+// These operate on T_L (the large factor); T_S is always stored as FP16.
+GGML_API void quantize_row_deco4_l_ref(const float * GGML_RESTRICT x, block_deco4_l * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_deco4_l  (const block_deco4_l * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_deco4_l      (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+GGML_API void quantize_row_deco8_l_ref(const float * GGML_RESTRICT x, block_deco8_l * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_deco8_l  (const block_deco8_l * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_deco8_l      (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+
+// Offline MPO decomposition: factorizes K[T×D] → T_L[T×R] + T_S[R×D]
+// T_L is returned as FP32 (caller then quantizes via quantize_deco4_l / quantize_deco8_l).
+// T_S is returned as FP16 for direct storage.
+// r = DECO_INNER_RANK, n_iter = ALS iterations (10 is sufficient).
+GGML_API void deco_mpo_decompose(
+    const float    * GGML_RESTRICT K,    // [T * D] row-major input
+    float          * GGML_RESTRICT TL,   // [T * R] output large factor (FP32)
+    ggml_fp16_t    * GGML_RESTRICT TS,   // [R * D] output small factor (FP16)
+    int T, int D, int R, int n_iter);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

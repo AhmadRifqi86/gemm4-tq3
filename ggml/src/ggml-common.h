@@ -331,6 +331,36 @@ typedef struct {
 } block_turbo2_0;                       // 10 bytes total
 static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
 
+// DecoQuant: data-free KV cache compression via MPO tensor decomposition (arXiv 2405.12591)
+//
+// The KV cache matrix K ∈ R^(T×D) is decomposed offline into:
+//   T_L ∈ R^(T×R)  — large tensor (~99% of params), narrow value range → quantized
+//   T_S ∈ R^(R×D)  — small tensor (~1%  of params), holds outliers   → kept FP16
+// Reconstruction: K ≈ dequant(T_L) × T_S
+//
+// R = DECO_INNER_RANK (default 8), applied after DECO_THRESHOLD tokens accumulate.
+// T_L is stored as blocks of QK_DECO values with a per-block absmax scale.
+
+#define QK_DECO       32    // block size for T_L quantization
+#define DECO_INNER_RANK 8   // MPO bond dimension (inner rank R)
+#define DECO_THRESHOLD  512 // decompose after this many tokens accumulate
+
+// 4-bit T_L block: scale (fp16) + 4-bit packed values
+// = 2 + 16 = 18 bytes per 32 values → 4.5 bits/value effective on T_L
+typedef struct {
+    ggml_half d;              //  2 bytes: absmax / 7 scale
+    uint8_t   qs[QK_DECO/2]; // 16 bytes: 4-bit signed values, nibble packed (val+8 in [0,15])
+} block_deco4_l;              // 18 bytes total
+static_assert(sizeof(block_deco4_l) == sizeof(ggml_half) + QK_DECO/2, "wrong deco4_l block size");
+
+// 8-bit T_L block: scale (fp16) + 8-bit values
+// = 2 + 32 = 34 bytes per 32 values → 8.5 bits/value effective on T_L
+typedef struct {
+    ggml_half d;           //  2 bytes: absmax / 127 scale
+    int8_t    qs[QK_DECO]; // 32 bytes: 8-bit signed values
+} block_deco8_l;            // 34 bytes total
+static_assert(sizeof(block_deco8_l) == sizeof(ggml_half) + QK_DECO, "wrong deco8_l block size");
+
 //
 // Super-block quantization structures
 //

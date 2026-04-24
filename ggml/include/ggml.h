@@ -431,7 +431,9 @@ extern "C" {
         GGML_TYPE_TURBO3_0 = 41, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
         GGML_TYPE_TURBO4_0 = 42, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
         GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_DECO4_L  = 44, // DecoQuant 4-bit T_L (large MPO factor, arXiv 2405.12591)
+        GGML_TYPE_DECO8_L  = 45, // DecoQuant 8-bit T_L (large MPO factor)
+        GGML_TYPE_COUNT    = 46,
     };
 
     // precision
