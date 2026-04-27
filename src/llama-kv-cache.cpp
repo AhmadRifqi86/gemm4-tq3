@@ -5,6 +5,9 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "../ggml/src/ggml-quants.h"  // deco_mpo_decompose, quantize_deco4_l, dequantize_row_deco4_l
+#include "../ggml/src/ggml-common.h"  // block_deco4_l, block_deco8_l, QK_DECO, DECO_INNER_RANK, DECO_THRESHOLD
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -119,6 +122,10 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // DecoQuant: detect and store effective deco types for K and V
+    deco_type_k = (type_k == GGML_TYPE_DECO4_L || type_k == GGML_TYPE_DECO8_L) ? type_k : GGML_TYPE_COUNT;
+    deco_type_v = (type_v == GGML_TYPE_DECO4_L || type_v == GGML_TYPE_DECO8_L) ? type_v : GGML_TYPE_COUNT;
+
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -201,6 +208,10 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
         }
+        // DecoQuant: use FP16 staging; lossy MPO compression applied periodically in deco_decompose_layer
+        if (deco_type_k != GGML_TYPE_COUNT) layer_type_k = GGML_TYPE_F16;
+        if (deco_type_v != GGML_TYPE_COUNT) layer_type_v = GGML_TYPE_F16;
+
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
@@ -318,6 +329,13 @@ void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+    }
+
+    // DecoQuant: reset staged token watermark
+    if (deco_type_k != GGML_TYPE_COUNT || deco_type_v != GGML_TYPE_COUNT) {
+        for (auto & layer : layers) {
+            layer.n_staged = 0;
+        }
     }
 
     if (data) {
@@ -740,6 +758,87 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
+// Decompose the K (and optionally V) staging tensors for layer il using MPO.
+// Reads the first n_tokens rows of the FP16 staging buffer, decomposes K ≈ T_L × T_S,
+// and writes back the lossy reconstruction so that get_k()/get_v() remain usable unchanged.
+void llama_kv_cache::deco_decompose_layer(uint32_t il, uint32_t n_tokens) {
+    if (n_tokens == 0) return;
+
+    const int32_t ikv = map_layer_ids.at(il);
+    const auto & layer = layers[ikv];
+
+    const uint32_t R = DECO_INNER_RANK;
+
+    // ── K decomposition ──────────────────────────────────────────────────────
+    if (deco_type_k != GGML_TYPE_COUNT && layer.k && layer.k->type == GGML_TYPE_F16) {
+        const uint32_t D = (uint32_t) layer.k->ne[0];  // n_embd_k_gqa
+        const uint32_t T = std::min(n_tokens, (uint32_t) layer.k->ne[1]);
+        const size_t row_bytes = (size_t)D * sizeof(ggml_fp16_t);
+
+        std::vector<ggml_fp16_t> buf_f16((size_t)T * D);
+        ggml_backend_tensor_get(layer.k, buf_f16.data(), 0, T * row_bytes);
+
+        std::vector<float> k_f32((size_t)T * D);
+        ggml_fp16_to_fp32_row(buf_f16.data(), k_f32.data(), (int64_t)(T * D));
+
+        std::vector<float>       tl((size_t)T * R);
+        std::vector<ggml_fp16_t> ts_f16((size_t)R * D);
+        deco_mpo_decompose(k_f32.data(), tl.data(), ts_f16.data(), (int)T, (int)D, (int)R, 10);
+
+        // Reconstruct K ≈ T_L @ T_S
+        std::vector<float> ts_f32((size_t)R * D);
+        ggml_fp16_to_fp32_row(ts_f16.data(), ts_f32.data(), (int64_t)(R * D));
+
+        std::fill(k_f32.begin(), k_f32.end(), 0.0f);
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t d = 0; d < D; d++) {
+                float acc = 0.0f;
+                for (uint32_t r = 0; r < R; r++) {
+                    acc += tl[t * R + r] * ts_f32[r * D + d];
+                }
+                k_f32[t * D + d] = acc;
+            }
+        }
+
+        ggml_fp32_to_fp16_row(k_f32.data(), buf_f16.data(), (int64_t)(T * D));
+        ggml_backend_tensor_set(layer.k, buf_f16.data(), 0, T * row_bytes);
+    }
+
+    // ── V decomposition (non-transposed layout only) ─────────────────────────
+    if (deco_type_v != GGML_TYPE_COUNT && layer.v && layer.v->type == GGML_TYPE_F16 && !v_trans) {
+        const uint32_t D = (uint32_t) layer.v->ne[0];  // n_embd_v_gqa
+        const uint32_t T = std::min(n_tokens, (uint32_t) layer.v->ne[1]);
+        const size_t row_bytes = (size_t)D * sizeof(ggml_fp16_t);
+
+        std::vector<ggml_fp16_t> buf_f16((size_t)T * D);
+        ggml_backend_tensor_get(layer.v, buf_f16.data(), 0, T * row_bytes);
+
+        std::vector<float> v_f32((size_t)T * D);
+        ggml_fp16_to_fp32_row(buf_f16.data(), v_f32.data(), (int64_t)(T * D));
+
+        std::vector<float>       tl((size_t)T * R);
+        std::vector<ggml_fp16_t> ts_f16((size_t)R * D);
+        deco_mpo_decompose(v_f32.data(), tl.data(), ts_f16.data(), (int)T, (int)D, (int)R, 10);
+
+        std::vector<float> ts_f32((size_t)R * D);
+        ggml_fp16_to_fp32_row(ts_f16.data(), ts_f32.data(), (int64_t)(R * D));
+
+        std::fill(v_f32.begin(), v_f32.end(), 0.0f);
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t d = 0; d < D; d++) {
+                float acc = 0.0f;
+                for (uint32_t r = 0; r < R; r++) {
+                    acc += tl[t * R + r] * ts_f32[r * D + d];
+                }
+                v_f32[t * D + d] = acc;
+            }
+        }
+
+        ggml_fp32_to_fp16_row(v_f32.data(), buf_f16.data(), (int64_t)(T * D));
+        ggml_backend_tensor_set(layer.v, buf_f16.data(), 0, T * row_bytes);
+    }
+}
+
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     bool updated = false;
 
@@ -810,6 +909,30 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto & cells = v_cells[s];
 
             cells.reset_shift();
+        }
+    }
+
+    // DecoQuant: run MPO decomposition when DECO_THRESHOLD new tokens have been staged.
+    // Restricted to single-stream caches; multi-stream support would need per-stream decomposition.
+    if (n_stream == 1 &&
+        (deco_type_k != GGML_TYPE_COUNT || deco_type_v != GGML_TYPE_COUNT)) {
+        const uint32_t total_used = v_cells[0].used_max_p1();
+        const uint32_t last_deco  = layers.empty() ? 0 : layers[0].n_staged;
+
+        if (total_used >= DECO_THRESHOLD && total_used > last_deco &&
+                total_used - last_deco >= DECO_THRESHOLD) {
+            llama_synchronize(lctx);
+
+            for (const auto & layer : layers) {
+                deco_decompose_layer(layer.il, total_used);
+            }
+            for (auto & layer : layers) {
+                layer.n_staged = total_used;
+            }
+
+            updated = true;
+            LLAMA_LOG_DEBUG("%s: DecoQuant decomposed %u tokens across %zu layers\n",
+                            __func__, total_used, layers.size());
         }
     }
 

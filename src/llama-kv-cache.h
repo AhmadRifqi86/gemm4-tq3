@@ -222,6 +222,27 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // DecoQuant (arXiv:2405.12591) — null when not using deco types.
+        //
+        // K = dequant(k_deco_tl) × k_deco_ts  (per-head batched matmul)
+        //
+        //  k_deco_tl : DECO4_L / DECO8_L  [n_embd_k_gqa, kv_size, n_stream]
+        //              quantised T_L — same shape as k, stores the large MPO factor
+        //  k_deco_ts : F16                [n_embd_head_k, n_embd_head_k, n_heads_kv]
+        //              T_S per-head mixing matrices (on CPU, small fixed cost)
+        //
+        // During update() the staging data in k (FP16) is decomposed in-place:
+        //   k[committed tokens] ← dequant(k_deco_tl) × k_deco_ts   (lossy reconstruction)
+        //   k_deco_tl is updated with the fresh quantised T_L
+        //   k_deco_ts is updated with the new per-head T_S matrices
+        //
+        // n_staged : tokens written to k since the last decomposition
+        ggml_tensor * k_deco_tl = nullptr;
+        ggml_tensor * v_deco_tl = nullptr;
+        ggml_tensor * k_deco_ts = nullptr;  // [head_dim, head_dim, n_heads_kv]
+        ggml_tensor * v_deco_ts = nullptr;
+        uint32_t n_staged = 0;  // tokens in FP16 staging not yet decomposed
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -265,8 +286,16 @@ private:
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;
 
+    // DecoQuant: effective cache types (GGML_TYPE_COUNT when not deco)
+    ggml_type deco_type_k = GGML_TYPE_COUNT;
+    ggml_type deco_type_v = GGML_TYPE_COUNT;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // Decompose layer il: read k/v staging, MPO-decompose, quantise T_L,
+    // store T_S, and overwrite k/v staging with the reconstructed (lossy) K/V.
+    void deco_decompose_layer(uint32_t il, uint32_t n_tokens);
 
     size_t total_size() const;
 
