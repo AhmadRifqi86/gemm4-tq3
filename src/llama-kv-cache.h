@@ -225,24 +225,28 @@ private:
 
         // DecoQuant (arXiv:2405.12591) — null when not using deco types.
         //
-        // K = dequant(k_deco_tl) × k_deco_ts  (per-head batched matmul)
+        // K ∈ R^(T×D)  →  T_L ∈ R^(T×R)  ×  T_S ∈ R^(R×D)   (R = DECO_INNER_RANK = 8)
         //
-        //  k_deco_tl : DECO4_L / DECO8_L  [n_embd_k_gqa, kv_size, n_stream]
-        //              quantised T_L — same shape as k, stores the large MPO factor
-        //  k_deco_ts : F16                [n_embd_head_k, n_embd_head_k, n_heads_kv]
-        //              T_S per-head mixing matrices (on CPU, small fixed cost)
+        //  k_deco_tl : F16  [DECO_INNER_RANK, kv_size, n_stream]
+        //              the large MPO factor T_L, stored per slot position.
+        //              Stage 3 will quantize this to DECO4_L / DECO8_L.
         //
-        // During update() the staging data in k (FP16) is decomposed in-place:
-        //   k[committed tokens] ← dequant(k_deco_tl) × k_deco_ts   (lossy reconstruction)
-        //   k_deco_tl is updated with the fresh quantised T_L
-        //   k_deco_ts is updated with the new per-head T_S matrices
+        //  k_deco_ts : F16  [DECO_INNER_RANK, n_embd_k_gqa]  (ne[0]=R, ne[1]=D)
+        //              the small mixing matrix T_S, refreshed on each decomposition.
         //
-        // n_staged : tokens written to k since the last decomposition
-        ggml_tensor * k_deco_tl = nullptr;
+        // During update() (once n_staged ≥ DECO_THRESHOLD):
+        //   1. ALS decomposes k staging → T_L, T_S
+        //   2. T_L is stored in k_deco_tl, T_S in k_deco_ts
+        //   3. k staging is overwritten with the lossy reconstruction T_L × T_S
+        //      so that get_k() continues to work without modifications (Stage 2).
+        //   Stage 3 will skip step 3 and build the reconstruction inside get_k().
+        //
+        // n_staged : watermark of total used tokens at time of last decomposition
+        ggml_tensor * k_deco_tl = nullptr;  // F16 [R, kv_size, n_stream]
         ggml_tensor * v_deco_tl = nullptr;
-        ggml_tensor * k_deco_ts = nullptr;  // [head_dim, head_dim, n_heads_kv]
-        ggml_tensor * v_deco_ts = nullptr;
-        uint32_t n_staged = 0;  // tokens in FP16 staging not yet decomposed
+        ggml_tensor * k_deco_ts = nullptr;  // F16 [R, n_embd_k_gqa]  (ne[0]=R, ne[1]=D)
+        ggml_tensor * v_deco_ts = nullptr;  // F16 [R, n_embd_v_gqa]  (ne[0]=R, ne[1]=D)
+        uint32_t n_staged = 0;  // total used tokens at last decomposition
     };
 
     bool v_trans = true;  // the value tensor is transposed

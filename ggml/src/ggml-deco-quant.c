@@ -53,8 +53,8 @@ void quantize_row_deco4_l_ref(const float * GGML_RESTRICT x,
 
         /* quantize and nibble-pack: q ∈ [-8, 7], stored as q+8 ∈ [0, 15] */
         for (int i = 0; i < QK_DECO / 2; i++) {
-            const int q0 = (int)(xb[2*i  ] * id + 0.5f);
-            const int q1 = (int)(xb[2*i+1] * id + 0.5f);
+            const int q0 = (int)roundf(xb[2*i  ] * id);
+            const int q1 = (int)roundf(xb[2*i+1] * id);
             const uint8_t qi0 = (uint8_t)((q0 < -8 ? -8 : q0 > 7 ? 7 : q0) + 8);
             const uint8_t qi1 = (uint8_t)((q1 < -8 ? -8 : q1 > 7 ? 7 : q1) + 8);
             yb->qs[i] = (qi0) | (qi1 << 4);
@@ -123,7 +123,7 @@ void quantize_row_deco8_l_ref(const float * GGML_RESTRICT x,
         yb->d = GGML_FP32_TO_FP16(d);
 
         for (int i = 0; i < QK_DECO; i++) {
-            int q = (int)(xb[i] * id + 0.5f);
+            int q = (int)roundf(xb[i] * id);
             if (q < -127) q = -127;
             if (q >  127) q =  127;
             yb->qs[i] = (int8_t)q;

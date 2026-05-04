@@ -68,13 +68,17 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    const bool is_deco = (deco_type_k != GGML_TYPE_COUNT || deco_type_v != GGML_TYPE_COUNT);
+
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
+            // +3 for turbo rotation matrices
+            // +4*n_layer_kv for deco: k_deco_tl, v_deco_tl, k_deco_ts, v_deco_ts (allocated on CPU)
+            const size_t deco_overhead = is_deco ? 4u * n_layer_kv : 0u;
             ggml_init_params params = {
-                // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + 3)*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + 3 + deco_overhead)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -229,6 +233,41 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+
+        // DecoQuant: allocate T_L and T_S factor tensors on CPU for each deco layer.
+        // T_L: [DECO_INNER_RANK, kv_size, n_stream] — the compact MPO large factor
+        // T_S: [n_embd_k/v_gqa, DECO_INNER_RANK]   — the small mixing matrix
+        // Both kept in FP16; Stage 3 will quantize T_L to DECO4_L for memory savings.
+        if (is_deco) {
+            const uint32_t R = DECO_INNER_RANK;
+            ggml_context * cpu_ctx = ctx_for_buft(ggml_backend_cpu_buffer_type());
+
+            if (deco_type_k != GGML_TYPE_COUNT && has_k) {
+                auto & last = layers.back();
+                // T_L: [R, kv_size, n_stream] — compact coefficient per token slot
+                last.k_deco_tl = ggml_new_tensor_3d(cpu_ctx, GGML_TYPE_F16,
+                                                     R, kv_size, n_stream);
+                ggml_format_name(last.k_deco_tl, "deco_k_tl_l%d", il);
+
+                // T_S: [R, n_embd_k_gqa] = [R, D]
+                // ggml_mul_mat(ts, tl) requires matching ne[0]: ts.ne[0]=R == tl.ne[0]=R
+                // → result [D, n_kv] = K reconstruction
+                last.k_deco_ts = ggml_new_tensor_2d(cpu_ctx, GGML_TYPE_F16,
+                                                     R, n_embd_k_gqa);
+                ggml_format_name(last.k_deco_ts, "deco_k_ts_l%d", il);
+            }
+
+            if (deco_type_v != GGML_TYPE_COUNT && has_v) {
+                auto & last = layers.back();
+                last.v_deco_tl = ggml_new_tensor_3d(cpu_ctx, GGML_TYPE_F16,
+                                                     R, kv_size, n_stream);
+                ggml_format_name(last.v_deco_tl, "deco_v_tl_l%d", il);
+
+                last.v_deco_ts = ggml_new_tensor_2d(cpu_ctx, GGML_TYPE_F16,
+                                                     R, n_embd_v_gqa);
+                ggml_format_name(last.v_deco_ts, "deco_v_ts_l%d", il);
+            }
+        }
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
@@ -785,7 +824,32 @@ void llama_kv_cache::deco_decompose_layer(uint32_t il, uint32_t n_tokens) {
         std::vector<ggml_fp16_t> ts_f16((size_t)R * D);
         deco_mpo_decompose(k_f32.data(), tl.data(), ts_f16.data(), (int)T, (int)D, (int)R, 10);
 
-        // Reconstruct K ≈ T_L @ T_S
+        // Store T_L in k_deco_tl: layout [R, kv_size] — each column is one token's R values.
+        // We transpose from [T, R] row-major to [R, T] by writing row r into column r.
+        if (layer.k_deco_tl) {
+            // k_deco_tl is [R, kv_size, n_stream] F16; write stream 0, positions 0..T-1
+            // Memory: element [r, t, 0] is at offset (t * R + r) * sizeof(f16)
+            // But ggml stores [R, kv_size] as row-major over R: element (r, t) at r*kv_size+t
+            // We need to transpose tl[T,R] → k_deco_tl[R,kv_size]
+            const uint32_t kv_size_tl = (uint32_t) layer.k_deco_tl->ne[1];
+            std::vector<ggml_fp16_t> tl_t((size_t)R * kv_size_tl, 0);
+            for (uint32_t t = 0; t < T; t++) {
+                for (uint32_t r = 0; r < R; r++) {
+                    tl_t[r * kv_size_tl + t] = ggml_fp32_to_fp16(tl[t * R + r]);
+                }
+            }
+            ggml_backend_tensor_set(layer.k_deco_tl, tl_t.data(), 0,
+                                    R * kv_size_tl * sizeof(ggml_fp16_t));
+        }
+
+        // Store T_S in k_deco_ts: [R, D] — ts_f16 from deco_mpo_decompose is already [R, D]
+        if (layer.k_deco_ts) {
+            ggml_backend_tensor_set(layer.k_deco_ts, ts_f16.data(), 0,
+                                    R * D * sizeof(ggml_fp16_t));
+        }
+
+        // Stage 2: write lossy reconstruction back to k staging so get_k() still works.
+        // Stage 3 will eliminate this write and reconstruct inside get_k() instead.
         std::vector<float> ts_f32((size_t)R * D);
         ggml_fp16_to_fp32_row(ts_f16.data(), ts_f32.data(), (int64_t)(R * D));
 
@@ -819,6 +883,23 @@ void llama_kv_cache::deco_decompose_layer(uint32_t il, uint32_t n_tokens) {
         std::vector<float>       tl((size_t)T * R);
         std::vector<ggml_fp16_t> ts_f16((size_t)R * D);
         deco_mpo_decompose(v_f32.data(), tl.data(), ts_f16.data(), (int)T, (int)D, (int)R, 10);
+
+        if (layer.v_deco_tl) {
+            const uint32_t kv_size_tl = (uint32_t) layer.v_deco_tl->ne[1];
+            std::vector<ggml_fp16_t> tl_t((size_t)R * kv_size_tl, 0);
+            for (uint32_t t = 0; t < T; t++) {
+                for (uint32_t r = 0; r < R; r++) {
+                    tl_t[r * kv_size_tl + t] = ggml_fp32_to_fp16(tl[t * R + r]);
+                }
+            }
+            ggml_backend_tensor_set(layer.v_deco_tl, tl_t.data(), 0,
+                                    R * kv_size_tl * sizeof(ggml_fp16_t));
+        }
+
+        if (layer.v_deco_ts) {
+            ggml_backend_tensor_set(layer.v_deco_ts, ts_f16.data(), 0,
+                                    R * D * sizeof(ggml_fp16_t));
+        }
 
         std::vector<float> ts_f32((size_t)R * D);
         ggml_fp16_to_fp32_row(ts_f16.data(), ts_f32.data(), (int64_t)(R * D));
@@ -1260,8 +1341,9 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
+    const auto & layer = layers[ikv];
 
-    auto * k = layers[ikv].k;
+    auto * k = layer.k;
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
@@ -1269,6 +1351,16 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    // Stage 2: deco_decompose_layer() writes the lossy reconstruction back into k
+    // so this path works correctly for all positions (both decomposed and staged).
+    //
+    // Stage 3 TODO: when n_staged == total_used (all tokens decomposed), skip the
+    // write-back and reconstruct here via:
+    //   tl_view = ggml_view_2d(ctx, k_deco_tl, R, n_kv, nb[1], s0*nb[2])
+    //   k_recon = ggml_mul_mat(ctx, k_deco_ts, tl_view)  → [D, n_kv]
+    //   return ggml_view_4d(ctx, k_recon, head_dim, n_heads, n_kv, 1, ...)
+    // This eliminates the staging buffer and achieves full memory compression.
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
