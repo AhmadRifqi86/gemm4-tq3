@@ -247,6 +247,28 @@ private:
         ggml_tensor * k_deco_ts = nullptr;  // F16 [R, n_embd_k_gqa]  (ne[0]=R, ne[1]=D)
         ggml_tensor * v_deco_ts = nullptr;  // F16 [R, n_embd_v_gqa]  (ne[0]=R, ne[1]=D)
         uint32_t n_staged = 0;  // total used tokens at last decomposition
+
+        // FAEDKV (arXiv:2507.20030) — frequency-domain compressed KV cache.
+        //
+        // After prefill, the "middle" segment of M = N-S-R historical tokens is
+        // transformed via FFT, the top-energy frequency chunks are selected, and
+        // n_kept = floor(ratio*M) virtual time-domain tokens are reconstructed via
+        // sparse IDFT and written back into cells [n_sink, n_sink+n_kept).
+        // Recent tokens are moved to [n_sink+n_kept, n_sink+n_kept+n_recent).
+        // This reduces n_kv from N to n_sink+n_kept+n_recent without attention bias.
+        //
+        // Stored state (CPU memory, complex float32):
+        //   k_faedkv_re/im : [n_kept × D_k] — retained freq coefficients for K
+        //   v_faedkv_re/im : [n_kept × D_v] — retained freq coefficients for V
+        //   faedkv_kept_bins : sorted kept bin indices
+        //   faedkv_M_hist : M at compression time (for IWDFT normalization)
+        std::vector<float>    k_faedkv_re, k_faedkv_im;  // [n_kept * D_k]
+        std::vector<float>    v_faedkv_re, v_faedkv_im;  // [n_kept * D_v]
+        std::vector<uint32_t> faedkv_kept_bins;           // sorted [n_kept]
+        uint32_t              faedkv_n_kept = 0;
+        uint32_t              faedkv_M_hist = 0;          // M at last compression
+        uint32_t              faedkv_Dk     = 0;
+        uint32_t              faedkv_Dv     = 0;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -297,9 +319,36 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
-    // Decompose layer il: read k/v staging, MPO-decompose, quantise T_L,
-    // store T_S, and overwrite k/v staging with the reconstructed (lossy) K/V.
+    // DecoQuant: Decompose layer il via MPO, store T_L/T_S, write-back reconstruction.
     void deco_decompose_layer(uint32_t il, uint32_t n_tokens);
+
+    // FAEDKV: configuration (read from env vars at construction time)
+    bool     faedkv_enabled  = false;
+    uint32_t faedkv_n_sink   = 10;    // S: attention-sink tokens kept verbatim
+    uint32_t faedkv_n_recent = 50;    // R: recent-window tokens kept verbatim
+    float    faedkv_ratio    = 0.125f; // r: fraction of freq bins to retain
+    uint32_t faedkv_n_chunks = 22;    // C: ablation-study chunk count
+    uint32_t faedkv_n_done   = 0;     // total_used when FAEDKV last ran (0 = not yet)
+
+    // FAEDKV: compress one layer's historical KV in the frequency domain.
+    // Reads K/V rows [hist_start, hist_end) (F16 or F32 only), performs FFT,
+    // selects n_kept freq bins by chunk energy, reconstructs n_kept virtual
+    // time-domain tokens via sparse IDFT, and writes them to rows
+    // [hist_start, hist_start+n_kept).  Stores the freq-domain state for
+    // potential future IWDFT decode updates.
+    void faedkv_compress_layer(uint32_t il,
+                                uint32_t hist_start,
+                                uint32_t hist_end,
+                                uint32_t n_kept);
+
+    // FAEDKV: reorganise KV-cell metadata after all layers have been compressed.
+    // Moves the R recent tokens from [n_total-n_recent, n_total) to
+    // [n_sink+n_kept, n_sink+n_kept+n_recent), then frees all other now-redundant
+    // cells so that used_max_p1() == n_sink+n_kept+n_recent.
+    void faedkv_reorganize_cells(uint32_t n_sink,
+                                  uint32_t n_kept,
+                                  uint32_t n_recent,
+                                  uint32_t n_total);
 
     size_t total_size() const;
 

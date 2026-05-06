@@ -8,13 +8,19 @@
 #include "../ggml/src/ggml-quants.h"  // deco_mpo_decompose, quantize_deco4_l, dequantize_row_deco4_l
 #include "../ggml/src/ggml-common.h"  // block_deco4_l, block_deco8_l, QK_DECO, DECO_INNER_RANK, DECO_THRESHOLD
 
+#ifdef GGML_USE_CUDA
+#include "../ggml/src/ggml-cuda/deco-quant.cuh"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <stdexcept>
+#include <vector>
 
 // InnerQ: cross-TU shared state for CUDA per-channel equalization.
 // These are defined in ggml-cuda/turbo-innerq.cu (when CUDA is enabled).
@@ -34,6 +40,189 @@ static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};
 static bool turbo_innerq_needs_tensor_update(void) { return false; }
 static void turbo_innerq_mark_tensor_updated(void) {}
 #endif
+
+//
+// FAEDKV: Frequency-Adaptive Infinite-Window DFT for KV cache compression
+// arXiv:2507.20030 — training-free, unbiased KV cache compression via FFT.
+//
+
+// Return the smallest power of 2 >= n.
+static uint32_t faedkv_next_pow2(uint32_t n) {
+    if (n == 0) return 1;
+    uint32_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+// Iterative Cooley-Tukey in-place FFT (complex float, n must be power-of-2).
+// Convention: X[k] = sum_{n} x[n] * e^{-j2πkn/N}  (DFT sign convention).
+static void faedkv_fft_1d(float * xr, float * xi, uint32_t n) {
+    // Bit-reversal permutation
+    for (uint32_t i = 1, j = 0; i < n; ++i) {
+        uint32_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            std::swap(xr[i], xr[j]);
+            std::swap(xi[i], xi[j]);
+        }
+    }
+    // Butterfly stages
+    for (uint32_t len = 2; len <= n; len <<= 1) {
+        const float ang = -2.0f * (float)M_PI / (float)len;
+        const float wre = cosf(ang), wim = sinf(ang);
+        for (uint32_t i = 0; i < n; i += len) {
+            float cur_re = 1.0f, cur_im = 0.0f;
+            for (uint32_t j = 0; j < len / 2; ++j) {
+                const float ure = xr[i + j], uim = xi[i + j];
+                const float vre = xr[i + j + len/2] * cur_re - xi[i + j + len/2] * cur_im;
+                const float vim = xr[i + j + len/2] * cur_im + xi[i + j + len/2] * cur_re;
+                xr[i + j]         = ure + vre;
+                xi[i + j]         = uim + vim;
+                xr[i + j + len/2] = ure - vre;
+                xi[i + j + len/2] = uim - vim;
+                const float tmp = cur_re * wre - cur_im * wim;
+                cur_im = cur_re * wim + cur_im * wre;
+                cur_re = tmp;
+            }
+        }
+    }
+}
+
+// Compute D independent 1-D FFTs of length M_padded along the TOKEN dimension.
+// x     : [M × D] row-major (row = one token, col = embedding dim); M <= M_padded.
+// re,im : [M_padded × D] output (zero-padded for n ∈ [M, M_padded)).
+static void faedkv_batch_fft(const float * x,
+                               float * re, float * im,
+                               uint32_t M, uint32_t M_padded, uint32_t D) {
+    std::vector<float> buf_re(M_padded), buf_im(M_padded);
+    for (uint32_t d = 0; d < D; ++d) {
+        // Gather column d from x (stride D) into the FFT buffer.
+        for (uint32_t n = 0; n < M; ++n) buf_re[n] = x[n * D + d];
+        std::fill(buf_re.begin() + M, buf_re.end(), 0.0f);
+        std::fill(buf_im.begin(), buf_im.end(), 0.0f);
+        faedkv_fft_1d(buf_re.data(), buf_im.data(), M_padded);
+        // Scatter back.
+        for (uint32_t k = 0; k < M_padded; ++k) {
+            re[k * D + d] = buf_re[k];
+            im[k * D + d] = buf_im[k];
+        }
+    }
+}
+
+// Select n_keep frequency bins from M_padded using chunk-based energy ranking.
+// Divides the spectrum into n_chunks contiguous chunks, ranks by Frobenius energy
+// across all D dimensions, and returns the top bins sorted in ascending order.
+// re,im : [M_padded × D]
+static std::vector<uint32_t> faedkv_select_bins(
+        const float * re, const float * im,
+        uint32_t M_padded, uint32_t D,
+        uint32_t n_chunks, uint32_t n_keep) {
+
+    if (n_keep >= M_padded) {
+        std::vector<uint32_t> all(M_padded);
+        std::iota(all.begin(), all.end(), 0);
+        return all;
+    }
+
+    const uint32_t chunk_sz = (M_padded + n_chunks - 1) / n_chunks;
+
+    // Per-chunk energy (sum of |X^f[k][d]|^2 across all k in chunk and all d).
+    std::vector<float> energy(n_chunks, 0.0f);
+    for (uint32_t c = 0; c < n_chunks; ++c) {
+        const uint32_t k0 = c * chunk_sz;
+        const uint32_t k1 = std::min(k0 + chunk_sz, M_padded);
+        for (uint32_t k = k0; k < k1; ++k) {
+            for (uint32_t d = 0; d < D; ++d) {
+                const float r = re[k * D + d], i = im[k * D + d];
+                energy[c] += r * r + i * i;
+            }
+        }
+    }
+
+    // Determine how many chunks to retain (rounding up to cover n_keep bins).
+    const uint32_t n_chunks_keep = std::min(
+        n_chunks,
+        (n_keep + chunk_sz - 1) / chunk_sz);
+
+    // Partially sort chunks by energy (descending) to find the top n_chunks_keep.
+    std::vector<uint32_t> order(n_chunks);
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + n_chunks_keep, order.end(),
+                      [&](uint32_t a, uint32_t b){ return energy[a] > energy[b]; });
+
+    // Collect the bin indices from the selected chunks, capped at n_keep.
+    std::vector<uint32_t> bins;
+    bins.reserve(n_keep);
+    for (uint32_t ci = 0; ci < n_chunks_keep && bins.size() < n_keep; ++ci) {
+        const uint32_t c  = order[ci];
+        const uint32_t k0 = c * chunk_sz;
+        const uint32_t k1 = std::min(k0 + chunk_sz, M_padded);
+        for (uint32_t k = k0; k < k1 && bins.size() < n_keep; ++k) {
+            bins.push_back(k);
+        }
+    }
+
+    std::sort(bins.begin(), bins.end());
+    return bins;
+}
+
+// Sparse IDFT: reconstruct n_out virtual time-domain tokens at positions
+// t = 0, 1, ..., n_out-1 from n_kept non-zero frequency bins.
+//
+// Formula:  K̃[t][d] = (1/M_padded) * sum_{k in kept_bins} (re[ki][d]*cos(2πkt/M_padded)
+//                                                          - im[ki][d]*sin(2πkt/M_padded))
+//
+// re,im      : [n_kept × D] — stored in kept_bins order
+// kept_bins  : [n_kept]     — sorted bin indices
+// out        : [n_out × D]  — reconstructed tokens
+static void faedkv_sparse_idft(const float * re, const float * im,
+                                 const uint32_t * kept_bins, uint32_t n_kept,
+                                 float * out, uint32_t n_out,
+                                 uint32_t M_padded, uint32_t D) {
+    const float scale = 1.0f / (float)M_padded;
+    std::fill(out, out + (size_t)n_out * D, 0.0f);
+    for (uint32_t ki = 0; ki < n_kept; ++ki) {
+        const uint32_t k = kept_bins[ki];
+        for (uint32_t t = 0; t < n_out; ++t) {
+            const float angle = 2.0f * (float)M_PI * (float)k * (float)t / (float)M_padded;
+            const float c = cosf(angle) * scale;
+            const float s = sinf(angle) * scale;
+            for (uint32_t d = 0; d < D; ++d) {
+                out[t * D + d] += re[ki * D + d] * c - im[ki * D + d] * s;
+            }
+        }
+    }
+}
+
+// IWDFT: update the per-bin freq-domain state with a new aging token x_new.
+// Equation 9 from the paper (approximating (N-1)/N ≈ 1 for large N):
+//   S_new[k] = W_k * (S[k] + x_new / N_virtual)
+// where W_k = e^{-j2πk/N_virtual}.
+//
+// re,im      : [n_kept × D] freq-domain state (updated IN-PLACE)
+// kept_bins  : [n_kept]
+// x_new      : [D] new aging token K or V vector (float32)
+// N_virtual  : current virtual sequence length (M_hist + number of aging steps)
+static void faedkv_iwdft_update(float * re, float * im,
+                                  const uint32_t * kept_bins, uint32_t n_kept,
+                                  const float * x_new, uint32_t D,
+                                  uint32_t N_virtual) {
+    const float inv_N = 1.0f / (float)N_virtual;
+    for (uint32_t ki = 0; ki < n_kept; ++ki) {
+        const uint32_t k = kept_bins[ki];
+        const float ang  = -2.0f * (float)M_PI * (float)k / (float)N_virtual;
+        const float w_re = cosf(ang), w_im = sinf(ang);
+        for (uint32_t d = 0; d < D; ++d) {
+            // Add x_new contribution (normalised).
+            const float s_re = re[ki * D + d] + x_new[d] * inv_N;
+            const float s_im = im[ki * D + d];
+            // Rotate by W_k.
+            re[ki * D + d] = w_re * s_re - w_im * s_im;
+            im[ki * D + d] = w_re * s_im + w_im * s_re;
+        }
+    }
+}
 
 //
 // llama_kv_cache
@@ -234,37 +423,28 @@ llama_kv_cache::llama_kv_cache(
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
 
-        // DecoQuant: allocate T_L and T_S factor tensors on CPU for each deco layer.
-        // T_L: [DECO_INNER_RANK, kv_size, n_stream] — the compact MPO large factor
-        // T_S: [n_embd_k/v_gqa, DECO_INNER_RANK]   — the small mixing matrix
-        // Both kept in FP16; Stage 3 will quantize T_L to DECO4_L for memory savings.
+        // DecoQuant: allocate T_L and T_S factor tensors on the SAME backend as k/v.
+        // On GPU builds, k is on the GPU context (ctx), so tl/ts live on GPU too.
+        // ggml_backend_tensor_set() handles H2D transfer after CPU-side ALS.
+        //
+        // T_L: FP16 [R, kv_size, n_stream] — MPO large factor, one column per token slot
+        // T_S: FP16 [R, D]                 — MPO small mixing matrix
         if (is_deco) {
             const uint32_t R = DECO_INNER_RANK;
-            ggml_context * cpu_ctx = ctx_for_buft(ggml_backend_cpu_buffer_type());
 
             if (deco_type_k != GGML_TYPE_COUNT && has_k) {
                 auto & last = layers.back();
-                // T_L: [R, kv_size, n_stream] — compact coefficient per token slot
-                last.k_deco_tl = ggml_new_tensor_3d(cpu_ctx, GGML_TYPE_F16,
-                                                     R, kv_size, n_stream);
+                last.k_deco_tl = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, R, kv_size, n_stream);
                 ggml_format_name(last.k_deco_tl, "deco_k_tl_l%d", il);
-
-                // T_S: [R, n_embd_k_gqa] = [R, D]
-                // ggml_mul_mat(ts, tl) requires matching ne[0]: ts.ne[0]=R == tl.ne[0]=R
-                // → result [D, n_kv] = K reconstruction
-                last.k_deco_ts = ggml_new_tensor_2d(cpu_ctx, GGML_TYPE_F16,
-                                                     R, n_embd_k_gqa);
+                last.k_deco_ts = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, R, n_embd_k_gqa);
                 ggml_format_name(last.k_deco_ts, "deco_k_ts_l%d", il);
             }
 
             if (deco_type_v != GGML_TYPE_COUNT && has_v) {
                 auto & last = layers.back();
-                last.v_deco_tl = ggml_new_tensor_3d(cpu_ctx, GGML_TYPE_F16,
-                                                     R, kv_size, n_stream);
+                last.v_deco_tl = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, R, kv_size, n_stream);
                 ggml_format_name(last.v_deco_tl, "deco_v_tl_l%d", il);
-
-                last.v_deco_ts = ggml_new_tensor_2d(cpu_ctx, GGML_TYPE_F16,
-                                                     R, n_embd_v_gqa);
+                last.v_deco_ts = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, R, n_embd_v_gqa);
                 ggml_format_name(last.v_deco_ts, "deco_v_ts_l%d", il);
             }
         }
@@ -362,6 +542,23 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // FAEDKV: read configuration from environment variables.
+    // Enable with FAEDKV=1; all other parameters have sensible defaults.
+    {
+        const char * e = getenv("FAEDKV");
+        faedkv_enabled = (e && atoi(e) != 0);
+        if (faedkv_enabled) {
+            if (const char * ev = getenv("FAEDKV_SINK"))   faedkv_n_sink   = (uint32_t)atoi(ev);
+            if (const char * ev = getenv("FAEDKV_RECENT")) faedkv_n_recent = (uint32_t)atoi(ev);
+            if (const char * ev = getenv("FAEDKV_RATIO"))  faedkv_ratio    = (float)atof(ev);
+            if (const char * ev = getenv("FAEDKV_CHUNKS")) faedkv_n_chunks = (uint32_t)atoi(ev);
+            faedkv_ratio = std::max(0.01f, std::min(1.0f, faedkv_ratio));
+            LLAMA_LOG_INFO("%s: FAEDKV enabled  sink=%u  recent=%u  ratio=%.3f  chunks=%u\n",
+                           __func__, faedkv_n_sink, faedkv_n_recent,
+                           (double)faedkv_ratio, faedkv_n_chunks);
+        }
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -374,6 +571,19 @@ void llama_kv_cache::clear(bool data) {
     if (deco_type_k != GGML_TYPE_COUNT || deco_type_v != GGML_TYPE_COUNT) {
         for (auto & layer : layers) {
             layer.n_staged = 0;
+        }
+    }
+
+    // FAEDKV: reset freq-domain state and compression watermark
+    if (faedkv_enabled) {
+        faedkv_n_done = 0;
+        for (auto & layer : layers) {
+            layer.k_faedkv_re.clear(); layer.k_faedkv_im.clear();
+            layer.v_faedkv_re.clear(); layer.v_faedkv_im.clear();
+            layer.faedkv_kept_bins.clear();
+            layer.faedkv_n_kept = 0;
+            layer.faedkv_M_hist = 0;
+            layer.faedkv_Dk = layer.faedkv_Dv = 0;
         }
     }
 
@@ -848,24 +1058,36 @@ void llama_kv_cache::deco_decompose_layer(uint32_t il, uint32_t n_tokens) {
                                     R * D * sizeof(ggml_fp16_t));
         }
 
-        // Stage 2: write lossy reconstruction back to k staging so get_k() still works.
-        // Stage 3 will eliminate this write and reconstruct inside get_k() instead.
-        std::vector<float> ts_f32((size_t)R * D);
-        ggml_fp16_to_fp32_row(ts_f16.data(), ts_f32.data(), (int64_t)(R * D));
-
-        std::fill(k_f32.begin(), k_f32.end(), 0.0f);
-        for (uint32_t t = 0; t < T; t++) {
-            for (uint32_t d = 0; d < D; d++) {
-                float acc = 0.0f;
-                for (uint32_t r = 0; r < R; r++) {
-                    acc += tl[t * R + r] * ts_f32[r * D + d];
+        // Write-back: reconstruct K ≈ T_L × T_S and store back into the staging buffer.
+        // On CPU (raspi): triple-loop in C++ — correct and adequate for non-GPU deployment.
+        // On GPU: the CUDA kernel (deco-quant.cu) does the same matmul on-device, avoiding
+        //         a round-trip back to host and replacing a slow CPU triple-loop with a
+        //         fast tiled half2 FMA kernel (the official DecoQuant fused reconstruction).
+        const bool k_on_gpu = layer.k->buffer && !ggml_backend_buffer_is_host(layer.k->buffer);
+        if (k_on_gpu) {
+#ifdef GGML_USE_CUDA
+            // T_L and T_S are already on GPU (written via ggml_backend_tensor_set above).
+            // Launch the fused CUDA kernel: K[D, T] = TS^T[D,R] × TL[R,T].
+            const uint32_t kv_size_tl = (uint32_t) layer.k_deco_tl->ne[1];
+            ggml_deco_reconstruct_cuda(
+                layer.k_deco_tl->data, layer.k_deco_ts->data, layer.k->data,
+                (int)T, (int)D, (int)kv_size_tl);
+#endif
+        } else {
+            // CPU path (unchanged — keeps Stage 2 write-back for raspi).
+            std::vector<float> ts_f32((size_t)R * D);
+            ggml_fp16_to_fp32_row(ts_f16.data(), ts_f32.data(), (int64_t)(R * D));
+            std::fill(k_f32.begin(), k_f32.end(), 0.0f);
+            for (uint32_t t = 0; t < T; t++) {
+                for (uint32_t d = 0; d < D; d++) {
+                    float acc = 0.0f;
+                    for (uint32_t r = 0; r < R; r++) acc += tl[t * R + r] * ts_f32[r * D + d];
+                    k_f32[t * D + d] = acc;
                 }
-                k_f32[t * D + d] = acc;
             }
+            ggml_fp32_to_fp16_row(k_f32.data(), buf_f16.data(), (int64_t)(T * D));
+            ggml_backend_tensor_set(layer.k, buf_f16.data(), 0, T * row_bytes);
         }
-
-        ggml_fp32_to_fp16_row(k_f32.data(), buf_f16.data(), (int64_t)(T * D));
-        ggml_backend_tensor_set(layer.k, buf_f16.data(), 0, T * row_bytes);
     }
 
     // ── V decomposition (non-transposed layout only) ─────────────────────────
@@ -901,23 +1123,231 @@ void llama_kv_cache::deco_decompose_layer(uint32_t il, uint32_t n_tokens) {
                                     R * D * sizeof(ggml_fp16_t));
         }
 
-        std::vector<float> ts_f32((size_t)R * D);
-        ggml_fp16_to_fp32_row(ts_f16.data(), ts_f32.data(), (int64_t)(R * D));
-
-        std::fill(v_f32.begin(), v_f32.end(), 0.0f);
-        for (uint32_t t = 0; t < T; t++) {
-            for (uint32_t d = 0; d < D; d++) {
-                float acc = 0.0f;
-                for (uint32_t r = 0; r < R; r++) {
-                    acc += tl[t * R + r] * ts_f32[r * D + d];
+        const bool v_on_gpu = layer.v->buffer && !ggml_backend_buffer_is_host(layer.v->buffer);
+        if (v_on_gpu) {
+#ifdef GGML_USE_CUDA
+            const uint32_t kv_size_tl = (uint32_t) layer.v_deco_tl->ne[1];
+            ggml_deco_reconstruct_cuda(
+                layer.v_deco_tl->data, layer.v_deco_ts->data, layer.v->data,
+                (int)T, (int)D, (int)kv_size_tl);
+#endif
+        } else {
+            std::vector<float> ts_f32((size_t)R * D);
+            ggml_fp16_to_fp32_row(ts_f16.data(), ts_f32.data(), (int64_t)(R * D));
+            std::fill(v_f32.begin(), v_f32.end(), 0.0f);
+            for (uint32_t t = 0; t < T; t++) {
+                for (uint32_t d = 0; d < D; d++) {
+                    float acc = 0.0f;
+                    for (uint32_t r = 0; r < R; r++) acc += tl[t * R + r] * ts_f32[r * D + d];
+                    v_f32[t * D + d] = acc;
                 }
-                v_f32[t * D + d] = acc;
             }
+            ggml_fp32_to_fp16_row(v_f32.data(), buf_f16.data(), (int64_t)(T * D));
+            ggml_backend_tensor_set(layer.v, buf_f16.data(), 0, T * row_bytes);
+        }
+    }
+}
+
+// ── FAEDKV implementation ─────────────────────────────────────────────────────
+
+// Helper: read F16 or F32 tensor rows [row0, row0+n_rows) into a float32 buffer.
+// Returns false (and leaves buf unmodified) when the type is not F16/F32.
+static bool faedkv_read_rows_f32(const ggml_tensor * t,
+                                   uint32_t row0, uint32_t n_rows,
+                                   std::vector<float> & buf) {
+    const uint32_t D    = (uint32_t)t->ne[0];
+    const size_t   row_bytes = (size_t)t->nb[1];   // bytes per row (token)
+    const size_t   offset    = (size_t)row0 * row_bytes;
+    const size_t   total     = (size_t)n_rows * row_bytes;
+
+    if (t->type == GGML_TYPE_F32) {
+        buf.resize((size_t)n_rows * D);
+        ggml_backend_tensor_get(t, buf.data(), offset, total);
+        return true;
+    }
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp((size_t)n_rows * D);
+        ggml_backend_tensor_get(t, tmp.data(), offset, total);
+        buf.resize((size_t)n_rows * D);
+        ggml_fp16_to_fp32_row(tmp.data(), buf.data(), (int64_t)((size_t)n_rows * D));
+        return true;
+    }
+    return false;   // unsupported type — skip FAEDKV for this tensor
+}
+
+// Helper: write float32 buffer back as F16 or F32 tensor rows [row0, row0+n_rows).
+static void faedkv_write_rows_f32(ggml_tensor * t,
+                                    uint32_t row0, uint32_t n_rows,
+                                    const std::vector<float> & buf) {
+    const uint32_t D        = (uint32_t)t->ne[0];
+    const size_t   row_bytes = (size_t)t->nb[1];
+    const size_t   offset    = (size_t)row0 * row_bytes;
+
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(t, buf.data(), offset, (size_t)n_rows * row_bytes);
+        return;
+    }
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp((size_t)n_rows * D);
+        ggml_fp32_to_fp16_row(buf.data(), tmp.data(), (int64_t)((size_t)n_rows * D));
+        ggml_backend_tensor_set(t, tmp.data(), offset, (size_t)n_rows * row_bytes);
+    }
+}
+
+// Compress one layer's historical K (and V when !v_trans) via FFT → prune → sparse IDFT.
+// Writes the n_kept reconstructed virtual tokens to rows [hist_start, hist_start+n_kept).
+void llama_kv_cache::faedkv_compress_layer(uint32_t il,
+                                             uint32_t hist_start,
+                                             uint32_t hist_end,
+                                             uint32_t n_kept) {
+    if (hist_end <= hist_start || n_kept == 0) return;
+
+    const uint32_t M         = hist_end - hist_start;
+    const uint32_t M_padded  = faedkv_next_pow2(M);
+    const int32_t  ikv       = map_layer_ids.at(il);
+    auto         & layer     = layers[ikv];
+
+    // ── K compression ───────────────────────────────────────────────────────
+    if (layer.k && (layer.k->type == GGML_TYPE_F16 || layer.k->type == GGML_TYPE_F32)) {
+        const uint32_t D_k = (uint32_t)layer.k->ne[0];
+        std::vector<float> k_f32;
+        if (!faedkv_read_rows_f32(layer.k, hist_start, M, k_f32)) return;
+
+        // FFT along the token dimension for all D_k embedding dims.
+        std::vector<float> k_re((size_t)M_padded * D_k);
+        std::vector<float> k_im((size_t)M_padded * D_k);
+        faedkv_batch_fft(k_f32.data(), k_re.data(), k_im.data(), M, M_padded, D_k);
+
+        // Frequency bin selection via chunk-based energy ranking.
+        const uint32_t n_keep_actual = std::min(n_kept, M_padded);
+        layer.faedkv_kept_bins = faedkv_select_bins(
+            k_re.data(), k_im.data(), M_padded, D_k, faedkv_n_chunks, n_keep_actual);
+        const uint32_t nk = (uint32_t)layer.faedkv_kept_bins.size();
+
+        // Store the retained complex freq coefficients.
+        layer.faedkv_n_kept = nk;
+        layer.faedkv_M_hist = M;
+        layer.faedkv_Dk     = D_k;
+        layer.k_faedkv_re.resize((size_t)nk * D_k);
+        layer.k_faedkv_im.resize((size_t)nk * D_k);
+        for (uint32_t ki = 0; ki < nk; ++ki) {
+            const uint32_t k = layer.faedkv_kept_bins[ki];
+            memcpy(&layer.k_faedkv_re[ki * D_k], &k_re[k * D_k], D_k * sizeof(float));
+            memcpy(&layer.k_faedkv_im[ki * D_k], &k_im[k * D_k], D_k * sizeof(float));
         }
 
-        ggml_fp32_to_fp16_row(v_f32.data(), buf_f16.data(), (int64_t)(T * D));
-        ggml_backend_tensor_set(layer.v, buf_f16.data(), 0, T * row_bytes);
+        // Reconstruct n_kept virtual tokens via sparse IDFT at t = 0..n_kept-1.
+        std::vector<float> k_recon((size_t)nk * D_k);
+        faedkv_sparse_idft(layer.k_faedkv_re.data(), layer.k_faedkv_im.data(),
+                            layer.faedkv_kept_bins.data(), nk,
+                            k_recon.data(), nk, M_padded, D_k);
+
+        // Write reconstructed tokens back to rows [hist_start, hist_start+n_kept).
+        faedkv_write_rows_f32(layer.k, hist_start, nk, k_recon);
     }
+
+    // ── V compression (only when V is not transposed) ────────────────────────
+    if (layer.v && !v_trans &&
+        (layer.v->type == GGML_TYPE_F16 || layer.v->type == GGML_TYPE_F32)) {
+        const uint32_t D_v = (uint32_t)layer.v->ne[0];
+        const uint32_t nk  = layer.faedkv_n_kept;   // same bin set as K
+        if (nk == 0) return;
+
+        std::vector<float> v_f32;
+        if (!faedkv_read_rows_f32(layer.v, hist_start, M, v_f32)) return;
+
+        std::vector<float> v_re((size_t)M_padded * D_v);
+        std::vector<float> v_im((size_t)M_padded * D_v);
+        faedkv_batch_fft(v_f32.data(), v_re.data(), v_im.data(), M, M_padded, D_v);
+
+        layer.faedkv_Dv = D_v;
+        layer.v_faedkv_re.resize((size_t)nk * D_v);
+        layer.v_faedkv_im.resize((size_t)nk * D_v);
+        for (uint32_t ki = 0; ki < nk; ++ki) {
+            const uint32_t k = layer.faedkv_kept_bins[ki];
+            memcpy(&layer.v_faedkv_re[ki * D_v], &v_re[k * D_v], D_v * sizeof(float));
+            memcpy(&layer.v_faedkv_im[ki * D_v], &v_im[k * D_v], D_v * sizeof(float));
+        }
+
+        std::vector<float> v_recon((size_t)nk * D_v);
+        faedkv_sparse_idft(layer.v_faedkv_re.data(), layer.v_faedkv_im.data(),
+                            layer.faedkv_kept_bins.data(), nk,
+                            v_recon.data(), nk, M_padded, D_v);
+        faedkv_write_rows_f32(layer.v, hist_start, nk, v_recon);
+    }
+}
+
+// Reorganise KV-cell metadata after all layers have been compressed.
+// Moves recent tokens [n_total-n_recent, n_total) to [n_sink+n_kept, n_sink+n_kept+n_recent).
+// Frees all remaining historical cells so that used_max_p1() == n_sink+n_kept+n_recent.
+void llama_kv_cache::faedkv_reorganize_cells(uint32_t n_sink,
+                                               uint32_t n_kept,
+                                               uint32_t n_recent,
+                                               uint32_t n_total) {
+    GGML_ASSERT(n_stream == 1 && "FAEDKV reorganisation only supported for single-stream caches");
+    auto & cells = v_cells[0];
+
+    const uint32_t recent_src_start = n_total - n_recent;   // old recent positions
+    const uint32_t recent_dst_start = n_sink  + n_kept;     // new recent positions
+
+    // Step 1: Copy each layer's K/V rows for the recent tokens to their new positions.
+    // The destination rows overlap with old historical cells — data copy first,
+    // then metadata update.
+    for (auto & layer : layers) {
+        if (layer.k) {
+            const size_t row_k = (size_t)layer.k->nb[1];
+            for (uint32_t r = 0; r < n_recent; ++r) {
+                const size_t src_off = (recent_src_start + r) * row_k;
+                const size_t dst_off = (recent_dst_start + r) * row_k;
+                std::vector<uint8_t> tmp(row_k);
+                ggml_backend_tensor_get(layer.k, tmp.data(), src_off, row_k);
+                ggml_backend_tensor_set(layer.k, tmp.data(), dst_off, row_k);
+            }
+        }
+        if (layer.v && !v_trans) {
+            const size_t row_v = (size_t)layer.v->nb[1];
+            for (uint32_t r = 0; r < n_recent; ++r) {
+                const size_t src_off = (recent_src_start + r) * row_v;
+                const size_t dst_off = (recent_dst_start + r) * row_v;
+                std::vector<uint8_t> tmp(row_v);
+                ggml_backend_tensor_get(layer.v, tmp.data(), src_off, row_v);
+                ggml_backend_tensor_set(layer.v, tmp.data(), dst_off, row_v);
+            }
+        }
+    }
+
+    // Step 2: Capture recent-token positions/sequences before modifying cells.
+    std::vector<llama_pos>    recent_pos(n_recent);
+    std::vector<llama_seq_id> recent_seq(n_recent);
+    for (uint32_t r = 0; r < n_recent; ++r) {
+        const uint32_t src = recent_src_start + r;
+        recent_pos[r] = cells.pos_get(src);
+        recent_seq[r] = cells.seq_get(src);
+    }
+
+    // Step 3: Update destination cell metadata (old historical cells → recent tokens).
+    for (uint32_t r = 0; r < n_recent; ++r) {
+        const uint32_t dst = recent_dst_start + r;
+        cells.rm(dst);                             // clear old historical metadata
+        cells.pos_set(dst, recent_pos[r]);
+        cells.seq_add(dst, recent_seq[r]);
+    }
+
+    // Step 4: Clear the old recent-source cells.
+    for (uint32_t r = 0; r < n_recent; ++r) {
+        const uint32_t src = recent_src_start + r;
+        cells.rm(src);
+    }
+
+    // Step 5: Free all remaining historical cells beyond the n_kept virtual tokens.
+    // Range: [n_sink+n_kept+n_recent, n_total-n_recent) — these are OLD historical
+    // cells that are neither virtual-K̃ nor recently-moved-recent.
+    for (uint32_t i = n_sink + n_kept + n_recent; i < recent_src_start; ++i) {
+        if (!cells.is_empty(i)) cells.rm(i);
+    }
+
+    // Advance the free-slot search head to the first genuinely free cell.
+    v_heads[0] = n_sink + n_kept + n_recent;
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
@@ -1014,6 +1444,35 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             updated = true;
             LLAMA_LOG_DEBUG("%s: DecoQuant decomposed %u tokens across %zu layers\n",
                             __func__, total_used, layers.size());
+        }
+    }
+
+    // FAEDKV: run frequency-domain compression once after prefill completes.
+    // Triggered on single-stream caches, exactly once (faedkv_n_done == 0), when
+    // there are enough historical tokens between the sink and recent windows.
+    if (faedkv_enabled && n_stream == 1 && swa_type == LLAMA_SWA_TYPE_NONE &&
+            faedkv_n_done == 0) {
+        const uint32_t total_used = v_cells[0].used_max_p1();
+        const uint32_t min_total  = faedkv_n_sink + faedkv_n_recent + 1;
+        if (total_used > min_total) {
+            llama_synchronize(lctx);
+
+            const uint32_t hist_start = faedkv_n_sink;
+            const uint32_t hist_end   = total_used - faedkv_n_recent;
+            const uint32_t M          = hist_end - hist_start;
+            const uint32_t n_kept     = std::max(1u, (uint32_t)(faedkv_ratio * (float)M));
+
+            for (const auto & layer : layers) {
+                faedkv_compress_layer(layer.il, hist_start, hist_end, n_kept);
+            }
+            faedkv_reorganize_cells(faedkv_n_sink, n_kept, faedkv_n_recent, total_used);
+            faedkv_n_done = total_used;
+
+            updated = true;
+            LLAMA_LOG_INFO("%s: FAEDKV compressed %u historical → %u virtual tokens "
+                           "across %zu layers (n_kv: %u→%u)\n",
+                           __func__, M, n_kept, layers.size(),
+                           total_used, faedkv_n_sink + n_kept + faedkv_n_recent);
         }
     }
 
@@ -1298,6 +1757,11 @@ bool llama_kv_cache::get_can_shift() const {
         return false;
     }
     if (hparams.n_pos_per_embd() > 1) {
+        return false;
+    }
+    // FAEDKV: after reorganisation the virtual K values have mixed RoPE-positions baked
+    // in; reapplying K-shift would corrupt them.
+    if (faedkv_n_done > 0) {
         return false;
     }
     return true;
