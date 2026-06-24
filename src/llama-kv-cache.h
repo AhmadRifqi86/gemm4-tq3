@@ -248,6 +248,18 @@ private:
         ggml_tensor * v_deco_ts = nullptr;  // F16 [R, n_embd_v_gqa]  (ne[0]=R, ne[1]=D)
         uint32_t n_staged = 0;  // total used tokens at last decomposition
 
+        // OjaKV (arXiv:2509.21623) — online low-rank KV cache compression.
+        //
+        // After prefill: U_k, U_v initialized via Oja's rule on pooled K/V.
+        // Every ojak_T decode tokens: lightweight Oja update using new tokens.
+        // Write-back: K̂ = U_k U_k^T K, V̂ = U_v U_v^T V stored in-place (Stage 2).
+        //
+        // U_k [r_k × n_embd_k_gqa] row-major — one shared basis across heads.
+        // U_v [r_v × n_embd_v_gqa] row-major.
+        std::vector<float> ojak_u_k;   // orthonormal key projection basis
+        std::vector<float> ojak_u_v;   // orthonormal value projection basis
+        uint32_t ojak_n_done = 0;      // total_used at last Oja update
+
         // FAEDKV (arXiv:2507.20030) — frequency-domain compressed KV cache.
         //
         // After prefill, the "middle" segment of M = N-S-R historical tokens is
@@ -322,6 +334,15 @@ private:
     // DecoQuant: Decompose layer il via MPO, store T_L/T_S, write-back reconstruction.
     void deco_decompose_layer(uint32_t il, uint32_t n_tokens);
 
+    // OjaKV: configuration (read from env vars OJAK, OJAK_RANK_K, etc. at construction)
+    bool     ojak_enabled     = false;
+    uint32_t ojak_rank_k      = 0;      // r_k: key compression rank (0 = 75% of head dim)
+    uint32_t ojak_rank_v      = 0;      // r_v: value compression rank
+    float    ojak_eta_prefill = 0.10f;  // Oja learning rate during prefill
+    float    ojak_eta_decode  = 0.01f;  // Oja learning rate during decode
+    uint32_t ojak_T           = 32;     // decode update period (in new tokens)
+    uint32_t ojak_pool_size   = 8;      // average-pool window for prefill Oja step
+
     // FAEDKV: configuration (read from env vars at construction time)
     bool     faedkv_enabled  = false;
     uint32_t faedkv_n_sink   = 10;    // S: attention-sink tokens kept verbatim
@@ -329,6 +350,11 @@ private:
     float    faedkv_ratio    = 0.125f; // r: fraction of freq bins to retain
     uint32_t faedkv_n_chunks = 22;    // C: ablation-study chunk count
     uint32_t faedkv_n_done   = 0;     // total_used when FAEDKV last ran (0 = not yet)
+
+    // OjaKV: run Oja's rule on layer il and write back K̂/V̂.
+    // n_tokens: how many cache slots are currently used.
+    // n_new_start: first index of tokens added since last update (0 = prefill).
+    void ojak_update_layer(uint32_t il, uint32_t n_tokens, uint32_t n_new_start);
 
     // FAEDKV: compress one layer's historical KV in the frequency domain.
     // Reads K/V rows [hist_start, hist_end) (F16 or F32 only), performs FFT,

@@ -89,55 +89,29 @@ static void faedkv_fft_1d(float * xr, float * xi, uint32_t n) {
     }
 }
 
-// Compute D independent 1-D FFTs of length M_padded along the TOKEN dimension.
-// x     : [M × D] row-major (row = one token, col = embedding dim); M <= M_padded.
-// re,im : [M_padded × D] output (zero-padded for n ∈ [M, M_padded)).
-static void faedkv_batch_fft(const float * x,
-                               float * re, float * im,
-                               uint32_t M, uint32_t M_padded, uint32_t D) {
-    std::vector<float> buf_re(M_padded), buf_im(M_padded);
-    for (uint32_t d = 0; d < D; ++d) {
-        // Gather column d from x (stride D) into the FFT buffer.
-        for (uint32_t n = 0; n < M; ++n) buf_re[n] = x[n * D + d];
-        std::fill(buf_re.begin() + M, buf_re.end(), 0.0f);
-        std::fill(buf_im.begin(), buf_im.end(), 0.0f);
-        faedkv_fft_1d(buf_re.data(), buf_im.data(), M_padded);
-        // Scatter back.
-        for (uint32_t k = 0; k < M_padded; ++k) {
-            re[k * D + d] = buf_re[k];
-            im[k * D + d] = buf_im[k];
-        }
-    }
+// Gather column d from x [M × D] row-major, zero-pad to M_padded, and FFT in place.
+// buf_re/buf_im : [M_padded] scratch, reused across channels by the caller —
+// keeps peak memory at O(M_padded) instead of O(M_padded × D).
+static void faedkv_channel_fft(const float * x, uint32_t M, uint32_t M_padded, uint32_t D, uint32_t d,
+                                 float * buf_re, float * buf_im) {
+    for (uint32_t n = 0; n < M; ++n) buf_re[n] = x[n * D + d];
+    std::fill(buf_re + M, buf_re + M_padded, 0.0f);
+    std::fill(buf_im, buf_im + M_padded, 0.0f);
+    faedkv_fft_1d(buf_re, buf_im, M_padded);
 }
 
-// Select n_keep frequency bins from M_padded using chunk-based energy ranking.
-// Divides the spectrum into n_chunks contiguous chunks, ranks by Frobenius energy
-// across all D dimensions, and returns the top bins sorted in ascending order.
-// re,im : [M_padded × D]
-static std::vector<uint32_t> faedkv_select_bins(
-        const float * re, const float * im,
-        uint32_t M_padded, uint32_t D,
-        uint32_t n_chunks, uint32_t n_keep) {
+// Select n_keep frequency bins given PRECOMPUTED per-chunk energy (Frobenius
+// energy across all D dimensions, accumulated by the caller one channel at a
+// time so the full [M_padded × D] spectrum never has to be materialized).
+// Returns the top bins (by chunk energy, descending) sorted in ascending order.
+static std::vector<uint32_t> faedkv_select_bins_from_energy(
+        const float * energy, uint32_t n_chunks, uint32_t chunk_sz,
+        uint32_t M_padded, uint32_t n_keep) {
 
     if (n_keep >= M_padded) {
         std::vector<uint32_t> all(M_padded);
         std::iota(all.begin(), all.end(), 0);
         return all;
-    }
-
-    const uint32_t chunk_sz = (M_padded + n_chunks - 1) / n_chunks;
-
-    // Per-chunk energy (sum of |X^f[k][d]|^2 across all k in chunk and all d).
-    std::vector<float> energy(n_chunks, 0.0f);
-    for (uint32_t c = 0; c < n_chunks; ++c) {
-        const uint32_t k0 = c * chunk_sz;
-        const uint32_t k1 = std::min(k0 + chunk_sz, M_padded);
-        for (uint32_t k = k0; k < k1; ++k) {
-            for (uint32_t d = 0; d < D; ++d) {
-                const float r = re[k * D + d], i = im[k * D + d];
-                energy[c] += r * r + i * i;
-            }
-        }
     }
 
     // Determine how many chunks to retain (rounding up to cover n_keep bins).
@@ -257,7 +231,8 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
-    const bool is_deco = (deco_type_k != GGML_TYPE_COUNT || deco_type_v != GGML_TYPE_COUNT);
+    const bool is_deco = (type_k == GGML_TYPE_DECO4_L || type_k == GGML_TYPE_DECO8_L ||
+                          type_v == GGML_TYPE_DECO4_L || type_v == GGML_TYPE_DECO8_L);
 
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -318,6 +293,22 @@ llama_kv_cache::llama_kv_cache(
     // DecoQuant: detect and store effective deco types for K and V
     deco_type_k = (type_k == GGML_TYPE_DECO4_L || type_k == GGML_TYPE_DECO8_L) ? type_k : GGML_TYPE_COUNT;
     deco_type_v = (type_v == GGML_TYPE_DECO4_L || type_v == GGML_TYPE_DECO8_L) ? type_v : GGML_TYPE_COUNT;
+
+    // OjaKV: read configuration from OJAK* env vars before the layer allocation loop
+    // so that F16 staging can be forced below.
+    {
+        const char * e = getenv("OJAK");
+        ojak_enabled = (e && atoi(e) != 0);
+        if (ojak_enabled) {
+            if (const char * ev = getenv("OJAK_RANK_K"))  ojak_rank_k      = (uint32_t)atoi(ev);
+            if (const char * ev = getenv("OJAK_RANK_V"))  ojak_rank_v      = (uint32_t)atoi(ev);
+            if (const char * ev = getenv("OJAK_ETA"))     ojak_eta_prefill = (float)atof(ev);
+            if (const char * ev = getenv("OJAK_ETA_DEC")) ojak_eta_decode  = (float)atof(ev);
+            if (const char * ev = getenv("OJAK_T"))       ojak_T           = (uint32_t)atoi(ev);
+            if (const char * ev = getenv("OJAK_POOL"))    ojak_pool_size   = (uint32_t)atoi(ev);
+            // Rank defaults will be resolved per-layer below (use 0 as sentinel).
+        }
+    }
 
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -404,6 +395,18 @@ llama_kv_cache::llama_kv_cache(
         // DecoQuant: use FP16 staging; lossy MPO compression applied periodically in deco_decompose_layer
         if (deco_type_k != GGML_TYPE_COUNT) layer_type_k = GGML_TYPE_F16;
         if (deco_type_v != GGML_TYPE_COUNT) layer_type_v = GGML_TYPE_F16;
+
+        // OjaKV: use FP16 staging; low-rank projection applied periodically in ojak_update_layer.
+        // Resolve default rank here using the actual head dimension for this layer.
+        if (ojak_enabled) {
+            layer_type_k = GGML_TYPE_F16;
+            if (!is_mla) layer_type_v = GGML_TYPE_F16;
+            if (ojak_rank_k == 0) ojak_rank_k = (uint32_t)std::max(1u, (uint32_t)(0.75f * (float)n_embd_k_gqa));
+            if (ojak_rank_v == 0) ojak_rank_v = (uint32_t)std::max(1u, (uint32_t)(0.75f * (float)hparams.n_embd_v_gqa(il)));
+            // Cap rank to actual dimension size
+            ojak_rank_k = std::min(ojak_rank_k, n_embd_k_gqa);
+            ojak_rank_v = std::min(ojak_rank_v, hparams.n_embd_v_gqa(il));
+        }
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
@@ -559,6 +562,15 @@ llama_kv_cache::llama_kv_cache(
                            (double)faedkv_ratio, faedkv_n_chunks);
         }
     }
+
+    // OjaKV: log final configuration (ranks may have been resolved inside the layer loop)
+    if (ojak_enabled) {
+        LLAMA_LOG_INFO("%s: OjaKV enabled  rank_k=%u  rank_v=%u"
+                       "  eta_pre=%.3f  eta_dec=%.3f  T=%u  pool=%u\n",
+                       __func__, ojak_rank_k, ojak_rank_v,
+                       (double)ojak_eta_prefill, (double)ojak_eta_decode,
+                       ojak_T, ojak_pool_size);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -571,6 +583,15 @@ void llama_kv_cache::clear(bool data) {
     if (deco_type_k != GGML_TYPE_COUNT || deco_type_v != GGML_TYPE_COUNT) {
         for (auto & layer : layers) {
             layer.n_staged = 0;
+        }
+    }
+
+    // OjaKV: reset projection bases so the next prefill re-learns U from scratch
+    if (ojak_enabled) {
+        for (auto & layer : layers) {
+            layer.ojak_u_k.clear();
+            layer.ojak_u_v.clear();
+            layer.ojak_n_done = 0;
         }
     }
 
@@ -1008,6 +1029,192 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 }
 
 // Decompose the K (and optionally V) staging tensors for layer il using MPO.
+//
+// OjaKV: Context-Aware Online Low-Rank KV Cache Compression
+// arXiv:2509.21623 — Oja's rule for online principal subspace tracking.
+//
+// Stage 2 implementation: projects K/V into a low-rank subspace and writes
+// back the reconstruction K̂ = U U^T K in-place.  No cache tensor reshape is
+// needed; the low-rank quality improvement is visible immediately in attention.
+//
+
+// Gram-Schmidt orthonormalization of U [r × d] (rows are the basis vectors).
+static void ojak_orthonormalize(float * U, int r, int d) {
+    for (int i = 0; i < r; ++i) {
+        float * ui = U + i * d;
+        for (int j = 0; j < i; ++j) {
+            const float * uj = U + j * d;
+            float dot = 0.0f;
+            for (int k = 0; k < d; ++k) dot += ui[k] * uj[k];
+            for (int k = 0; k < d; ++k) ui[k] -= dot * uj[k];
+        }
+        float norm = 0.0f;
+        for (int k = 0; k < d; ++k) norm += ui[k] * ui[k];
+        norm = sqrtf(norm);
+        if (norm > 1e-8f) {
+            for (int k = 0; k < d; ++k) ui[k] /= norm;
+        }
+    }
+}
+
+// Initialise U [r × d] as a random orthonormal matrix via LCG + Gram-Schmidt.
+static void ojak_rand_orthonormal(float * U, int r, int d, uint64_t seed) {
+    for (int i = 0; i < r * d; ++i) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        U[i] = (float)((int32_t)(seed >> 33)) * (1.0f / 2147483648.0f);
+    }
+    ojak_orthonormalize(U, r, d);
+}
+
+// Compute C = X^T X / n  where X is [n × d] row-major.  C is [d × d].
+static void ojak_covariance(float * C, const float * X, int n, int d) {
+    std::fill(C, C + (size_t)d * d, 0.0f);
+    for (int t = 0; t < n; ++t) {
+        const float * xt = X + (size_t)t * d;
+        for (int i = 0; i < d; ++i)
+            for (int j = 0; j < d; ++j)
+                C[i*d+j] += xt[i] * xt[j];
+    }
+    const float inv_n = 1.0f / (float)n;
+    for (int i = 0; i < d * d; ++i) C[i] *= inv_n;
+}
+
+// Average-pool X [n × d] with window size p, returning X_pool [ceil(n/p) × d].
+static std::vector<float> ojak_avg_pool(const float * X, int n, int d, int p) {
+    const int np = (n + p - 1) / p;
+    std::vector<float> Xp((size_t)np * d, 0.0f);
+    for (int i = 0; i < n; ++i) {
+        const int pi = i / p;
+        for (int j = 0; j < d; ++j) Xp[(size_t)pi*d+j] += X[(size_t)i*d+j];
+    }
+    for (int i = 0; i < np; ++i) {
+        const float inv = 1.0f / (float)std::min(p, n - i * p);
+        for (int j = 0; j < d; ++j) Xp[(size_t)i*d+j] *= inv;
+    }
+    return Xp;
+}
+
+// Oja batch update: U [r × d] += eta * (U C - U C U^T U)  where C [d × d].
+// Derived from the paper's (Appendix A.1) formula transposed to row-major.
+static void ojak_oja_step(float * U, const float * C, float eta, int r, int d) {
+    // UC = U @ C  [r × d]
+    std::vector<float> UC((size_t)r * d, 0.0f);
+    for (int i = 0; i < r; ++i)
+        for (int k = 0; k < d; ++k) {
+            if (U[i*d+k] == 0.0f) continue;
+            for (int j = 0; j < d; ++j)
+                UC[i*d+j] += U[i*d+k] * C[k*d+j];
+        }
+
+    // UtU = U^T @ U  [d × d]
+    std::vector<float> UtU((size_t)d * d, 0.0f);
+    for (int i = 0; i < d; ++i)
+        for (int k = 0; k < r; ++k) {
+            if (U[k*d+i] == 0.0f) continue;
+            for (int j = 0; j < d; ++j)
+                UtU[i*d+j] += U[k*d+i] * U[k*d+j];
+        }
+
+    // delta = UC - UC @ UtU  [r × d]
+    // = U C (I - U^T U)  which is the correct Oja gradient in row-major convention
+    for (int i = 0; i < r; ++i)
+        for (int j = 0; j < d; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < d; ++k) s += UC[i*d+k] * UtU[k*d+j];
+            U[i*d+j] += eta * (UC[i*d+j] - s);
+        }
+}
+
+// Project K [n × d] in-place: k_hat = U^T (U k) for each row.
+// K is replaced with K̂ = U^T U K (the low-rank reconstruction).
+static void ojak_project_inplace(float * K, const float * U, int n, int r, int d) {
+    std::vector<float> proj(r);
+    std::vector<float> k_hat(d);
+    for (int t = 0; t < n; ++t) {
+        float * k = K + (size_t)t * d;
+        for (int i = 0; i < r; ++i) {
+            proj[i] = 0.0f;
+            for (int j = 0; j < d; ++j) proj[i] += U[i*d+j] * k[j];
+        }
+        std::fill(k_hat.begin(), k_hat.end(), 0.0f);
+        for (int i = 0; i < r; ++i)
+            for (int j = 0; j < d; ++j)
+                k_hat[j] += U[i*d+j] * proj[i];
+        for (int j = 0; j < d; ++j) k[j] = k_hat[j];
+    }
+}
+
+// Read F16 tensor rows [0, n_tokens), update U via Oja's rule, write back K̂ in F16.
+// n_new_start == 0  → prefill (all tokens are "new"; use average pooling + higher eta).
+// n_new_start  > 0  → decode  (only rows [n_new_start, n_tokens) used for Oja step).
+static void ojak_update_kv(
+        ggml_tensor * tensor, std::vector<float> & U,
+        uint32_t n_tokens, uint32_t n_new_start,
+        uint32_t rank, float eta_prefill, float eta_decode, uint32_t pool_size) {
+
+    if (!tensor || tensor->type != GGML_TYPE_F16) return;
+
+    const uint32_t D = (uint32_t)tensor->ne[0];
+    const uint32_t T = std::min(n_tokens, (uint32_t)tensor->ne[1]);
+    if (T == 0 || rank == 0 || rank > D) return;
+
+    const size_t row_bytes = (size_t)D * sizeof(ggml_fp16_t);
+
+    // Read from backend (GPU→CPU if needed)
+    std::vector<ggml_fp16_t> buf_f16((size_t)T * D);
+    ggml_backend_tensor_get(tensor, buf_f16.data(), 0, T * row_bytes);
+
+    std::vector<float> kv_f32((size_t)T * D);
+    ggml_fp16_to_fp32_row(buf_f16.data(), kv_f32.data(), (int64_t)(T * D));
+
+    // Initialise U lazily (first time this layer/KV is processed)
+    if (U.size() != (size_t)rank * D) {
+        U.resize((size_t)rank * D);
+        // Seed differs by pointer so K and V get different initial bases
+        const uint64_t seed = (uint64_t)(uintptr_t)tensor + 0xdeadbeefcafe1234ULL;
+        ojak_rand_orthonormal(U.data(), (int)rank, (int)D, seed);
+    }
+
+    std::vector<float> cov((size_t)D * D);
+
+    if (n_new_start == 0) {
+        // Prefill: pool then compute covariance over pooled samples
+        const auto pooled = ojak_avg_pool(kv_f32.data(), (int)T, (int)D, (int)pool_size);
+        const int np = (int)pooled.size() / (int)D;
+        ojak_covariance(cov.data(), pooled.data(), np, (int)D);
+        ojak_oja_step(U.data(), cov.data(), eta_prefill, (int)rank, (int)D);
+    } else {
+        // Decode: use only newly added tokens for the Oja step
+        const uint32_t n_new = (T > n_new_start) ? (T - n_new_start) : 0;
+        if (n_new > 0) {
+            ojak_covariance(cov.data(), kv_f32.data() + (size_t)n_new_start * D,
+                            (int)n_new, (int)D);
+            ojak_oja_step(U.data(), cov.data(), eta_decode, (int)rank, (int)D);
+        }
+    }
+
+    ojak_orthonormalize(U.data(), (int)rank, (int)D);
+
+    // Project every token in the cache and write back K̂
+    ojak_project_inplace(kv_f32.data(), U.data(), (int)T, (int)rank, (int)D);
+
+    ggml_fp32_to_fp16_row(kv_f32.data(), buf_f16.data(), (int64_t)(T * D));
+    ggml_backend_tensor_set(tensor, buf_f16.data(), 0, T * row_bytes);
+}
+
+void llama_kv_cache::ojak_update_layer(uint32_t il, uint32_t n_tokens, uint32_t n_new_start) {
+    const int32_t ikv = map_layer_ids.at(il);
+    auto & layer = layers[ikv];
+
+    ojak_update_kv(layer.k, layer.ojak_u_k, n_tokens, n_new_start,
+                   ojak_rank_k, ojak_eta_prefill, ojak_eta_decode, ojak_pool_size);
+
+    if (!v_trans) {
+        ojak_update_kv(layer.v, layer.ojak_u_v, n_tokens, n_new_start,
+                       ojak_rank_v, ojak_eta_prefill, ojak_eta_decode, ojak_pool_size);
+    }
+}
+
 // Reads the first n_tokens rows of the FP16 staging buffer, decomposes K ≈ T_L × T_S,
 // and writes back the lossy reconstruction so that get_k()/get_v() remain usable unchanged.
 void llama_kv_cache::deco_decompose_layer(uint32_t il, uint32_t n_tokens) {
@@ -1207,33 +1414,53 @@ void llama_kv_cache::faedkv_compress_layer(uint32_t il,
     const int32_t  ikv       = map_layer_ids.at(il);
     auto         & layer     = layers[ikv];
 
+    const uint32_t chunk_sz = (M_padded + faedkv_n_chunks - 1) / faedkv_n_chunks;
+
     // ── K compression ───────────────────────────────────────────────────────
+    // Two passes over channels, reusing an O(M_padded) scratch buffer instead
+    // of materializing the full [M_padded × D] spectrum (which is what made
+    // this blow up memory-wise at long contexts): pass 1 accumulates per-chunk
+    // energy to pick the kept bins, pass 2 recomputes the FFT and extracts
+    // only those bins directly into the small persistent [n_kept × D] arrays.
     if (layer.k && (layer.k->type == GGML_TYPE_F16 || layer.k->type == GGML_TYPE_F32)) {
         const uint32_t D_k = (uint32_t)layer.k->ne[0];
         std::vector<float> k_f32;
         if (!faedkv_read_rows_f32(layer.k, hist_start, M, k_f32)) return;
 
-        // FFT along the token dimension for all D_k embedding dims.
-        std::vector<float> k_re((size_t)M_padded * D_k);
-        std::vector<float> k_im((size_t)M_padded * D_k);
-        faedkv_batch_fft(k_f32.data(), k_re.data(), k_im.data(), M, M_padded, D_k);
+        std::vector<float> buf_re(M_padded), buf_im(M_padded);
 
-        // Frequency bin selection via chunk-based energy ranking.
+        // Pass 1: per-chunk energy across all channels.
+        std::vector<float> energy(faedkv_n_chunks, 0.0f);
+        for (uint32_t d = 0; d < D_k; ++d) {
+            faedkv_channel_fft(k_f32.data(), M, M_padded, D_k, d, buf_re.data(), buf_im.data());
+            for (uint32_t c = 0; c < faedkv_n_chunks; ++c) {
+                const uint32_t k0 = c * chunk_sz;
+                const uint32_t k1 = std::min(k0 + chunk_sz, M_padded);
+                for (uint32_t k = k0; k < k1; ++k) {
+                    energy[c] += buf_re[k] * buf_re[k] + buf_im[k] * buf_im[k];
+                }
+            }
+        }
+
         const uint32_t n_keep_actual = std::min(n_kept, M_padded);
-        layer.faedkv_kept_bins = faedkv_select_bins(
-            k_re.data(), k_im.data(), M_padded, D_k, faedkv_n_chunks, n_keep_actual);
+        layer.faedkv_kept_bins = faedkv_select_bins_from_energy(
+            energy.data(), faedkv_n_chunks, chunk_sz, M_padded, n_keep_actual);
         const uint32_t nk = (uint32_t)layer.faedkv_kept_bins.size();
 
-        // Store the retained complex freq coefficients.
         layer.faedkv_n_kept = nk;
         layer.faedkv_M_hist = M;
         layer.faedkv_Dk     = D_k;
-        layer.k_faedkv_re.resize((size_t)nk * D_k);
-        layer.k_faedkv_im.resize((size_t)nk * D_k);
-        for (uint32_t ki = 0; ki < nk; ++ki) {
-            const uint32_t k = layer.faedkv_kept_bins[ki];
-            memcpy(&layer.k_faedkv_re[ki * D_k], &k_re[k * D_k], D_k * sizeof(float));
-            memcpy(&layer.k_faedkv_im[ki * D_k], &k_im[k * D_k], D_k * sizeof(float));
+        layer.k_faedkv_re.assign((size_t)nk * D_k, 0.0f);
+        layer.k_faedkv_im.assign((size_t)nk * D_k, 0.0f);
+
+        // Pass 2: recompute per-channel FFT, extract only the kept bins.
+        for (uint32_t d = 0; d < D_k; ++d) {
+            faedkv_channel_fft(k_f32.data(), M, M_padded, D_k, d, buf_re.data(), buf_im.data());
+            for (uint32_t ki = 0; ki < nk; ++ki) {
+                const uint32_t k = layer.faedkv_kept_bins[ki];
+                layer.k_faedkv_re[ki * D_k + d] = buf_re[k];
+                layer.k_faedkv_im[ki * D_k + d] = buf_im[k];
+            }
         }
 
         // Reconstruct n_kept virtual tokens via sparse IDFT at t = 0..n_kept-1.
@@ -1247,6 +1474,7 @@ void llama_kv_cache::faedkv_compress_layer(uint32_t il,
     }
 
     // ── V compression (only when V is not transposed) ────────────────────────
+    // Bin selection already happened for K, so V only needs the extraction pass.
     if (layer.v && !v_trans &&
         (layer.v->type == GGML_TYPE_F16 || layer.v->type == GGML_TYPE_F32)) {
         const uint32_t D_v = (uint32_t)layer.v->ne[0];
@@ -1256,17 +1484,19 @@ void llama_kv_cache::faedkv_compress_layer(uint32_t il,
         std::vector<float> v_f32;
         if (!faedkv_read_rows_f32(layer.v, hist_start, M, v_f32)) return;
 
-        std::vector<float> v_re((size_t)M_padded * D_v);
-        std::vector<float> v_im((size_t)M_padded * D_v);
-        faedkv_batch_fft(v_f32.data(), v_re.data(), v_im.data(), M, M_padded, D_v);
+        std::vector<float> buf_re(M_padded), buf_im(M_padded);
 
         layer.faedkv_Dv = D_v;
-        layer.v_faedkv_re.resize((size_t)nk * D_v);
-        layer.v_faedkv_im.resize((size_t)nk * D_v);
-        for (uint32_t ki = 0; ki < nk; ++ki) {
-            const uint32_t k = layer.faedkv_kept_bins[ki];
-            memcpy(&layer.v_faedkv_re[ki * D_v], &v_re[k * D_v], D_v * sizeof(float));
-            memcpy(&layer.v_faedkv_im[ki * D_v], &v_im[k * D_v], D_v * sizeof(float));
+        layer.v_faedkv_re.assign((size_t)nk * D_v, 0.0f);
+        layer.v_faedkv_im.assign((size_t)nk * D_v, 0.0f);
+
+        for (uint32_t d = 0; d < D_v; ++d) {
+            faedkv_channel_fft(v_f32.data(), M, M_padded, D_v, d, buf_re.data(), buf_im.data());
+            for (uint32_t ki = 0; ki < nk; ++ki) {
+                const uint32_t k = layer.faedkv_kept_bins[ki];
+                layer.v_faedkv_re[ki * D_v + d] = buf_re[k];
+                layer.v_faedkv_im[ki * D_v + d] = buf_im[k];
+            }
         }
 
         std::vector<float> v_recon((size_t)nk * D_v);
@@ -1473,6 +1703,38 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                            "across %zu layers (n_kv: %u→%u)\n",
                            __func__, M, n_kept, layers.size(),
                            total_used, faedkv_n_sink + n_kept + faedkv_n_recent);
+        }
+    }
+
+    // OjaKV: online low-rank update.
+    // Prefill: triggered once when the cache first contains tokens (n_done == 0).
+    // Decode:  triggered every ojak_T new tokens.
+    // Restricted to single-stream caches (multi-stream would need per-stream bookkeeping).
+    if (ojak_enabled && n_stream == 1) {
+        const uint32_t total_used = v_cells[0].used_max_p1();
+        const uint32_t last_done  = layers.empty() ? 0u : layers[0].ojak_n_done;
+
+        const bool is_prefill      = (last_done == 0 && total_used > 0);
+        const bool is_decode_step  = (!is_prefill && total_used > last_done &&
+                                      total_used - last_done >= ojak_T);
+
+        if (is_prefill || is_decode_step) {
+            llama_synchronize(lctx);
+
+            const uint32_t n_new_start = is_prefill ? 0u : last_done;
+
+            for (const auto & layer : layers) {
+                ojak_update_layer(layer.il, total_used, n_new_start);
+            }
+            for (auto & layer : layers) {
+                layer.ojak_n_done = total_used;
+            }
+
+            updated = true;
+            LLAMA_LOG_DEBUG("%s: OjaKV %s  tokens=%u  new_from=%u  layers=%zu  rank_k=%u  rank_v=%u\n",
+                            __func__, is_prefill ? "prefill-init" : "decode-update",
+                            total_used, n_new_start, layers.size(),
+                            ojak_rank_k, ojak_rank_v);
         }
     }
 
